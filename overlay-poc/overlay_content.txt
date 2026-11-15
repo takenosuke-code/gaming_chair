@@ -1,0 +1,5 @@
+overlay POC — edit this file, it refreshes live
+Ctrl+Alt+H toggle    Ctrl+Alt+Q quit
+
+This text is visible to your eyes but blank
+in any screenshot / screen-recording / share.
