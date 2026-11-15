@@ -46,3 +46,67 @@ python -c "from PIL import ImageGrab; ImageGrab.grab().save('shot.png')"
 ```
 
 `shot.png` will not contain the overlay text.
+
+---
+
+## Liquid-glass screen watcher (`glass_overlay.py`)
+
+A polished version of the overlay: a frosted **"liquid glass"** panel
+(translucent acrylic blur, rounded corners, hairline accent border, clean
+Segoe UI typography) that can also **watch your screen** and show an answer.
+
+```
+python glass_overlay.py
+```
+
+**Window chrome is still standard-library only** (tkinter + ctypes). The glass
+look comes from Win32 directly:
+
+- **Acrylic blur** — `SetWindowCompositionAttribute` with
+  `ACCENT_ENABLE_ACRYLICBLURBEHIND` (frosted blur-behind).
+- **Rounded corners + border** — DWM `DWMWA_WINDOW_CORNER_PREFERENCE` and
+  `DWMWA_BORDER_COLOR` (Windows 11).
+- Still **click-through**, **always-on-top**, **no taskbar/alt-tab**, and
+  **excluded from screen capture** (`WDA_EXCLUDEFROMCAPTURE`) — blank in any
+  screenshot / recording / share, same as `overlay.py`.
+
+### Hotkeys (global)
+
+| Key | Action |
+|---|---|
+| `Ctrl+Alt+Space` | capture screen → OCR → answer → show in panel |
+| `Ctrl+Alt+H` | toggle the panel on/off |
+| `Ctrl+Alt+L` | lock/unlock click-through (unlock to drag the panel) |
+| `Ctrl+Alt+← ↑ → ↓` | nudge the panel 20px |
+| `Ctrl+Alt+Q` | quit |
+
+### The screen-watch pipeline (pluggable)
+
+`capture → OCR → answer`, each a plain function you can swap:
+
+1. **`grab_screen(region)`** — screen capture. Uses Pillow's `ImageGrab`.
+2. **`ocr_image(img)`** — text extraction. Uses `pytesseract` if present.
+3. **`answer_question(text)`** — returns the string to display. **Stubbed by
+   default**; fill in the clearly-marked `TODO` to call a model.
+
+If a step's dependency is missing, the panel shows a short install hint instead
+of crashing — the UI itself never needs these.
+
+### Optional dependencies (only for the watcher)
+
+```
+pip install pillow        # screen capture (grab_screen)
+pip install pytesseract   # OCR  — also install the Tesseract engine exe
+pip install anthropic     # only if you wire answer_question() to a model
+```
+
+### API key (never hardcoded)
+
+`answer_question()` reads the key from the **`OVERLAY_API_KEY`** environment
+variable and leaves the actual model call as a `TODO`. No key is stored in the
+source. Until you set it and fill the TODO, the panel echoes the captured text
+as a stub so you can see the pipeline working end-to-end.
+
+```powershell
+$env:OVERLAY_API_KEY = "your-key-here"   # PowerShell, current session only
+```
