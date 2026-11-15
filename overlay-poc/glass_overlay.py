@@ -15,22 +15,23 @@ Design goals (this redesign):
     * Apple-quality -- restrained monochrome palette, generous spacing, a tidy
                        header, a quiet status line, and clean corners.
 
-On a hotkey it *watches your screen*: it grabs a region, runs it through a
-pluggable OCR step, hands the text to a pluggable "answer" function, and paints
-the result in the glass panel.
+On a hotkey it *watches your screen*: it grabs a screenshot, sends it to an
+Azure AI Foundry vision model, and paints the model's description of what's on
+screen into the glass panel -- a simple way to confirm the capture -> model
+pipeline is wired up correctly.
 
 Run
 ---
     python glass_overlay.py
 
 The window chrome (acrylic glass + rounded corners + capture-exclusion + DPI
-awareness) is pure standard library (tkinter + ctypes). The optional
-screen-reading pipeline uses extra packages only if you want OCR / a real AI
-answer -- see README.md. Without them the UI still runs and the watcher degrades
-gracefully with a clear message.
+awareness) is pure standard library (tkinter + ctypes). The screen-describe
+step needs Pillow for the capture (`pip install pillow`) and the Azure env vars
+below for the model call -- see README.md. Without them the UI still runs and
+the describer shows a clear hint instead of crashing.
 
 Hotkeys (global; work even though the panel is click-through):
-    Ctrl+Alt+Space   capture screen now -> OCR -> answer -> show in panel
+    Ctrl+Alt+Space   capture screen now -> describe via model -> show in panel
     Ctrl+Alt+H       toggle the panel on/off
     Ctrl+Alt+L       lock/unlock click-through (unlock to drag the panel)
     Ctrl+Alt+Arrows  nudge the panel 20px
@@ -75,6 +76,27 @@ HINT_FONT = ("Segoe UI", 9)
 
 EXCLUDE_FROM_CAPTURE = True   # keep the panel out of screenshots/recordings
 PERIODIC_WATCH_MS = 0         # 0 = hotkey-only; e.g. 5000 = auto every 5s
+
+# --- Model: Azure AI Foundry / Azure OpenAI vision deployment ---------
+# A plain connectivity check: capture the screen and ask the model to DESCRIBE
+# what it sees, so you can confirm the capture -> model pipeline is hooked up.
+# Every secret comes from environment variables -- nothing is hardcoded here:
+#   AZURE_AI_ENDPOINT     https://<your-resource>.openai.azure.com
+#   AZURE_AI_DEPLOYMENT   your vision-capable deployment name (e.g. gpt-4o)
+#   AZURE_AI_KEY          the resource API key
+#   AZURE_AI_API_VERSION  optional; defaults below
+# See README.md for the Azure AI Foundry setup steps.
+AZURE_API_VERSION_DEFAULT = "2024-10-21"
+MAX_IMAGE_WIDTH = 1536   # downscale before upload: smaller payload, same gist
+
+# Clearly-labeled system prompt -- tweak freely. This is a screen DESCRIBER,
+# not a question-answerer: it just reports what's on screen.
+DESCRIBE_SYSTEM_PROMPT = (
+    "You are a screen describer running as a connectivity check. Look at the "
+    "screenshot and concisely describe what is visible: the active app or "
+    "window, the main UI elements, and any prominent on-screen text. Keep it "
+    "to a few short sentences and just report what you see."
+)
 
 # ======================================================================
 # Win32 plumbing (stdlib ctypes only)
@@ -224,7 +246,7 @@ def harden_window(hwnd, capture_excluded=True):
 
 
 # ======================================================================
-# Screen watcher pipeline  (capture -> OCR -> answer)
+# Screen watcher pipeline  (capture -> describe)
 # ======================================================================
 def grab_screen(region=None):
     """Capture the screen (or a region) to a PIL Image.
@@ -244,59 +266,81 @@ def grab_screen(region=None):
     return ImageGrab.grab()
 
 
-def ocr_image(img):
-    """Pluggable OCR. Uses pytesseract if installed, else returns a hint.
+def describe_screen(img):
+    """Send the captured screen image to an Azure AI Foundry vision deployment
+    and return its description. This is a pure connectivity/debug check -- it
+    just reports what's on screen so you can confirm the pipeline is hooked up.
 
-    Swap this body for any OCR you like (Windows.Media.Ocr, a cloud OCR, etc).
+    All config comes from environment variables (see the top of this file); no
+    keys are stored in the source. Uses stdlib ``urllib`` for the HTTP call, so
+    there is nothing to ``pip install`` for the model request itself (only
+    Pillow, for the screen capture).
     """
     if img is None:
         return ("[no capture] install Pillow for screen capture:\n"
                 "    pip install pillow")
+
+    endpoint = os.environ.get("AZURE_AI_ENDPOINT")
+    deployment = os.environ.get("AZURE_AI_DEPLOYMENT")
+    key = os.environ.get("AZURE_AI_KEY")
+    api_version = os.environ.get("AZURE_AI_API_VERSION", AZURE_API_VERSION_DEFAULT)
+
+    if not (endpoint and deployment and key):
+        return ("[not configured] set these environment variables, then press\n"
+                "Ctrl+Alt+Space again:\n"
+                "    AZURE_AI_ENDPOINT    https://<resource>.openai.azure.com\n"
+                "    AZURE_AI_DEPLOYMENT  <your vision deployment name>\n"
+                "    AZURE_AI_KEY         <your resource key>\n"
+                "See README.md for the Azure AI Foundry setup steps.")
+
     try:
-        import pytesseract
-    except Exception:
-        return ("[captured ok, but no OCR] install Tesseract + pytesseract:\n"
-                "    pip install pytesseract   (and install the Tesseract exe)")
-    try:
-        return pytesseract.image_to_string(img).strip()
+        import io
+        import base64
+        import json
+        import urllib.request
+        import urllib.error
+
+        # Downscale before upload: a full 4K screen is a big payload and the
+        # description doesn't need native resolution.
+        shot = img.convert("RGB")
+        if shot.width > MAX_IMAGE_WIDTH:
+            new_h = int(shot.height * (MAX_IMAGE_WIDTH / shot.width))
+            shot = shot.resize((MAX_IMAGE_WIDTH, new_h))
+        buf = io.BytesIO()
+        shot.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        data_url = "data:image/jpeg;base64," + b64
+
+        url = (endpoint.rstrip("/") + "/openai/deployments/" + deployment +
+               "/chat/completions?api-version=" + api_version)
+        payload = {
+            "messages": [
+                {"role": "system", "content": DESCRIBE_SYSTEM_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Describe what is on this screen."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ]},
+            ],
+            "max_tokens": 500,
+            "temperature": 0.2,
+        }
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "api-key": key},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            detail = ""
+        return (f"[Azure error {e.code}] check endpoint / deployment / key / "
+                f"api-version.\n{detail}")
     except Exception as e:
-        return f"[OCR error] {e}"
-
-
-def answer_question(text):
-    """Pluggable AI answer. Takes the captured/OCR'd text, returns a string.
-
-    Default: a stub. Wire up a real model by filling in the TODO below. The API
-    key is read from the OVERLAY_API_KEY environment variable -- never hardcode
-    a key in this file.
-    """
-    text = (text or "").strip()
-    if not text:
-        return "[watcher] nothing readable on screen yet."
-
-    api_key = os.environ.get("OVERLAY_API_KEY")
-    if not api_key:
-        preview = text if len(text) <= 400 else text[:400] + " ..."
-        return ("[stub answer -- no OVERLAY_API_KEY set]\n"
-                "Captured text:\n" + preview + "\n\n"
-                "Set OVERLAY_API_KEY and fill in answer_question() to get a "
-                "real reply.")
-
-    # --- TODO: wire up your model of choice here -----------------------
-    # Example shape (uncomment and `pip install anthropic`):
-    #
-    #   from anthropic import Anthropic
-    #   client = Anthropic(api_key=api_key)
-    #   msg = client.messages.create(
-    #       model="claude-sonnet-5-5",
-    #       max_tokens=1024,
-    #       messages=[{"role": "user",
-    #                  "content": "Answer concisely:\n\n" + text}],
-    #   )
-    #   return msg.content[0].text
-    # -------------------------------------------------------------------
-    return ("[OVERLAY_API_KEY is set, but answer_question() still has the TODO "
-            "stub. Fill in the model call to get real answers.]")
+        return f"[model call failed] {e}"
 
 
 # ======================================================================
@@ -410,18 +454,17 @@ class GlassOverlay:
             return
         self.busy = True
         self.status.config(text="Reading…")
-        # run the capture/OCR/answer pipeline off the UI thread
+        # run the capture -> describe pipeline off the UI thread
         threading.Thread(target=self._watch_worker, daemon=True).start()
 
     def _watch_worker(self):
         try:
-            # hide self briefly so we don't OCR our own panel (it's already
+            # hide self briefly so we don't capture our own panel (it's already
             # capture-excluded, but ImageGrab on some setups still sees it)
             self.root.after(0, self.root.withdraw)
             img = grab_screen(CAPTURE_REGION)
             self.root.after(0, self.root.deiconify)
-            text = ocr_image(img)
-            answer = answer_question(text)
+            answer = describe_screen(img)
         except Exception as e:
             answer = f"[watcher error] {e}"
         self.root.after(0, lambda: self._show_answer(answer))
